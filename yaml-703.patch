@@ -1,0 +1,185 @@
+diff --git a/src/compose/resolve-block-scalar.ts b/src/compose/resolve-block-scalar.ts
+index 155722c..6e7accf 100644
+--- a/src/compose/resolve-block-scalar.ts
++++ b/src/compose/resolve-block-scalar.ts
+@@ -3,6 +3,7 @@ import { Scalar } from '../nodes/Scalar.ts'
+ import type { BlockScalar } from '../parse/cst.ts'
+ import type { ComposeContext } from './compose-node.ts'
+ import type { ComposeErrorHandler } from './composer.ts'
++import { findNonPrintable } from './util-find-non-printable.ts'
+ 
+ export function resolveBlockScalar(
+   ctx: ComposeContext,
+@@ -128,6 +129,17 @@ export function resolveBlockScalar(
+       value += '\n'
+   }
+ 
++  const badIndex = findNonPrintable(value)
++  if (badIndex !== -1) {
++    const cc = value.codePointAt(badIndex)!
++    const code = `U+${cc.toString(16).toUpperCase().padStart(4, '0')}`
++    onError(
++      start + badIndex,
++      'UNEXPECTED_TOKEN',
++      `Scalar value contains a non-printable character: ${code}`
++    )
++  }
++
+   const end = start + header.length + scalar.source.length
+   return { value, type, comment: header.comment, range: [start, end, end] }
+ }
+diff --git a/src/compose/resolve-flow-scalar.ts b/src/compose/resolve-flow-scalar.ts
+index f82f0c4..e138627 100644
+--- a/src/compose/resolve-flow-scalar.ts
++++ b/src/compose/resolve-flow-scalar.ts
+@@ -4,6 +4,10 @@ import { Scalar } from '../nodes/Scalar.ts'
+ import type { FlowScalar } from '../parse/cst.ts'
+ import type { ComposeErrorHandler } from './composer.ts'
+ import { resolveEnd } from './resolve-end.ts'
++import {
++  findNonPrintable,
++  findRawNonPrintable
++} from './util-find-non-printable.ts'
+ 
+ type FlowScalarErrorHandler = (
+   offset: number,
+@@ -57,6 +61,24 @@ export function resolveFlowScalar(
+       }
+   }
+ 
++  // Non-printable characters are not valid in scalar values, but in
++  // double-quoted scalars they may be included via escape sequences,
++  // so for those only the raw source is checked.
++  const badIndex =
++    _type === Scalar.QUOTE_DOUBLE
++      ? findRawNonPrintable(source)
++      : findNonPrintable(value)
++  if (badIndex !== -1) {
++    const str = _type === Scalar.QUOTE_DOUBLE ? source : value
++    const cc = str.codePointAt(badIndex)!
++    const code = `U+${cc.toString(16).toUpperCase().padStart(4, '0')}`
++    _onError(
++      badIndex,
++      'UNEXPECTED_TOKEN',
++      `Scalar value contains a non-printable character: ${code}`
++    )
++  }
++
+   const valueEnd = offset + source.length
+   const re = resolveEnd(end, valueEnd, strict, onError)
+   return {
+diff --git a/src/compose/util-find-non-printable.ts b/src/compose/util-find-non-printable.ts
+new file mode 100644
+index 0000000..002092a
+--- /dev/null
++++ b/src/compose/util-find-non-printable.ts
+@@ -0,0 +1,52 @@
++/**
++ * Matches characters that are not printable according to the YAML spec,
++ * i.e. C0 control characters other than tab, LF and CR, DEL, C1 control
++ * characters other than NEL, and lone surrogates. Valid surrogate pairs
++ * are not matched. Neither are U+FFFE & U+FFFF, which the stringifier
++ * similarly emits as-is.
++ */
++const nonPrintableRe =
++  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u0080-\u0084\u0086-\u009f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/
++
++/**
++ * Like `nonPrintableRe`, for individual characters in the source of a
++ * double-quoted scalar. DEL is not matched here, as it is valid
++ * unescaped in JSON strings, and neither are surrogates, which are
++ * handled separately to account for valid pairs.
++ */
++const rawNonPrintableRe =
++  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u0080-\u0084\u0086-\u009f]/
++
++/**
++ * Returns the index of the first non-printable character in `value`,
++ * or -1 if there is none.
++ */
++export function findNonPrintable(value: string): number {
++  const match = nonPrintableRe.exec(value)
++  return match ? match.index : -1
++}
++
++/**
++ * Returns the index of the first non-printable character in the source
++ * of a double-quoted scalar, or -1 if there is none. Characters
++ * included via escape sequences are valid, and are not reported.
++ */
++export function findRawNonPrintable(source: string): number {
++  for (let i = 0; i < source.length; ++i) {
++    const ch = source[i]
++    if (ch === '\\') {
++      i += 1
++      continue
++    }
++    const cc = source.charCodeAt(i)
++    if (cc >= 0xd800 && cc <= 0xdbff) {
++      const next = source.charCodeAt(i + 1)
++      if (next >= 0xdc00 && next <= 0xdfff)
++        i += 1 // valid surrogate pair
++      else return i // lone high surrogate
++    } else if (cc >= 0xdc00 && cc <= 0xdfff) {
++      return i // lone low surrogate
++    } else if (rawNonPrintableRe.test(ch)) return i
++  }
++  return -1
++}
+diff --git a/tests/doc/errors.ts b/tests/doc/errors.ts
+index b326996..5a7e07a 100644
+--- a/tests/doc/errors.ts
++++ b/tests/doc/errors.ts
+@@ -70,6 +70,52 @@ describe('flow scalars', () => {
+   })
+ })
+ 
++describe('non-printable characters (#703)', () => {
++  test('error on raw C0 control character in double-quoted scalar', () => {
++    const doc = YAML.parseDocument('key: "a\u0001b"')
++    expect(doc.errors).toHaveLength(1)
++    expect(doc.errors[0]).toMatchObject({
++      code: 'UNEXPECTED_TOKEN',
++      message: expect.stringContaining(
++        'Scalar value contains a non-printable character: U+0001'
++      )
++    })
++  })
++
++  test('error on raw C0 control character in plain scalar', () => {
++    const doc = YAML.parseDocument('key: a\u0001b\n')
++    expect(doc.errors).toHaveLength(1)
++    expect(doc.errors[0]).toMatchObject({
++      code: 'UNEXPECTED_TOKEN',
++      message: expect.stringContaining(
++        'Scalar value contains a non-printable character: U+0001'
++      )
++    })
++  })
++
++  test('error on C0 control character in block scalar', () => {
++    const doc = YAML.parseDocument('key: |\n  a\u0002b\n')
++    expect(doc.errors).toHaveLength(1)
++    expect(doc.errors[0]).toMatchObject({
++      code: 'UNEXPECTED_TOKEN',
++      message: expect.stringContaining(
++        'Scalar value contains a non-printable character: U+0002'
++      )
++    })
++  })
++
++  test('no error on escaped, NEL, tab, newline or astral characters', () => {
++    const doc = YAML.parseDocument('key: "a\\u0001b"')
++    expect(doc.errors).toHaveLength(0)
++    const doc2 = YAML.parseDocument('key: "a\\u0085b"')
++    expect(doc2.errors).toHaveLength(0)
++    const doc3 = YAML.parseDocument('key: |\n  a\tb\n  c\n')
++    expect(doc3.errors).toHaveLength(0)
++    const doc4 = YAML.parseDocument('key: "\\U0001F600"')
++    expect(doc4.errors).toHaveLength(0)
++  })
++})
++
+ describe('block collections', () => {
+   test('mapping with bad indentation', () => {
+     const src = 'foo: "1"\n bar: 2\n'
